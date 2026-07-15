@@ -868,13 +868,34 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
       <div><strong id="stat-states">0</strong><span>states</span></div>
       <div><strong id="stat-courses">0</strong><span>course notes</span></div>
     </div>
-    <button class="primary-action" type="button" data-next="state">Start exploring</button>
+    <button class="primary-action" type="button" data-next="search">Start exploring</button>
+  </section>
+
+  <section class="finder-panel step" data-step="search">
+    <div class="panel-head">
+      <button class="ghost-action" type="button" data-next="intro">Back</button>
+      <span>Step 1 of 4</span>
+    </div>
+    <h2>How would you like to explore?</h2>
+    <p class="muted">Start with a destination state, or find a specific operator first.</p>
+    <div class="path-grid">
+      <button class="choice-card path-card" type="button" data-next="state">
+        <img src="/static/location.png" alt="">
+        <strong>Search by state</strong>
+        <span>Choose where you are traveling, then compare course notes or operators there.</span>
+      </button>
+      <button class="choice-card path-card" type="button" data-next="operator">
+        <img src="/static/member.png" alt="">
+        <strong>Search by operator</strong>
+        <span>Find a person across the full directory, then review their course access.</span>
+      </button>
+    </div>
   </section>
 
   <section class="finder-panel step" data-step="state">
     <div class="panel-head">
-      <button class="ghost-action" type="button" data-next="intro">Back</button>
-      <span>Step 1 of 4</span>
+      <button class="ghost-action" type="button" data-next="search">Back</button>
+      <span>State search</span>
     </div>
     <h2>Where are you headed?</h2>
     <p class="muted">Start typing to find a state, then choose where you are traveling.</p>
@@ -882,6 +903,19 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
       <input id="stateSearchBox" type="search" placeholder="Search states, like Georgia or South Carolina" autocomplete="off">
     </div>
     <div class="state-grid" id="stateGrid"></div>
+  </section>
+
+  <section class="finder-panel step" data-step="operator">
+    <div class="panel-head">
+      <button class="ghost-action" type="button" data-next="search">Back</button>
+      <span>Operator search</span>
+    </div>
+    <h2>Who are you looking for?</h2>
+    <p class="muted">Search the full directory by operator name, state, city, course, role, or handicap.</p>
+    <div class="filter-row state-search">
+      <input id="operatorSearchBox" type="search" placeholder="Search operators, cities, states, or courses" autocomplete="off">
+    </div>
+    <div class="course-list" id="operatorList"></div>
   </section>
 
   <section class="finder-panel step" data-step="path">
@@ -918,7 +952,7 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
   <section class="results-panel step" data-step="results">
     <div class="results-top">
       <div class="results-heading">
-        <button class="ghost-action" type="button" data-next="course">Back</button>
+        <button class="ghost-action" type="button" id="resultsBackButton" data-next="course">Back</button>
         <div>
           <p class="eyebrow" id="resultsEyebrow">Matches</p>
           <h2 id="resultsTitle">Available connections</h2>
@@ -1064,10 +1098,7 @@ button { cursor: pointer; }
 .topbar-brand img {
   width: 58px;
   height: 58px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  object-fit: cover;
-  background: #fff;
+  object-fit: contain;
 }
 .workspace {
   position: relative;
@@ -1641,9 +1672,12 @@ var appJS = `
 
   const stateGrid = document.getElementById('stateGrid');
   const stateSearchBox = document.getElementById('stateSearchBox');
+  const operatorSearchBox = document.getElementById('operatorSearchBox');
+  const operatorList = document.getElementById('operatorList');
   const courseList = document.getElementById('courseList');
   const memberGrid = document.getElementById('memberGrid');
   const searchBox = document.getElementById('searchBox');
+  const resultsBackButton = document.getElementById('resultsBackButton');
   const unique = (items) => Array.from(new Set(items.filter(Boolean))).sort((a, b) => a.localeCompare(b));
   const byState = unique(members.map((m) => m.state));
   const byCourse = unique(members.map((m) => m.homeCourse));
@@ -1663,6 +1697,11 @@ var appJS = `
       if (stateSearchBox) stateSearchBox.value = '';
       renderStates('');
       window.setTimeout(() => stateSearchBox?.focus(), 40);
+    }
+    if (step === 'operator') {
+      if (operatorSearchBox) operatorSearchBox.value = '';
+      renderOperators('');
+      window.setTimeout(() => operatorSearchBox?.focus(), 40);
     }
     if (step === 'results') {
       window.setTimeout(() => searchBox?.focus(), 40);
@@ -1690,6 +1729,20 @@ var appJS = `
 
   stateSearchBox?.addEventListener('input', function () {
     renderStates(stateSearchBox.value);
+  });
+
+  operatorSearchBox?.addEventListener('input', function () {
+    renderOperators(operatorSearchBox.value);
+  });
+
+  operatorList.addEventListener('click', function (event) {
+    const card = event.target.closest('[data-operator]');
+    if (!card) return;
+    selectedState = '';
+    selectedMode = 'operator';
+    selectedOption = card.dataset.operator;
+    activeMatches = members.filter((m) => memberName(m) === selectedOption);
+    showResults('operator');
   });
 
   stateGrid.addEventListener('click', function (event) {
@@ -1746,15 +1799,7 @@ var appJS = `
       if (m.state !== selectedState) return false;
       return selectedMode === 'operator' ? memberName(m) === selectedOption : m.homeCourse === selectedOption;
     });
-    searchBox.value = '';
-    renderMembers(activeMatches);
-    document.getElementById('resultsEyebrow').textContent = selectedState + ' / ' + activeMatches.length + ' match' + (activeMatches.length === 1 ? '' : 'es');
-    document.getElementById('resultsTitle').textContent = selectedOption;
-    document.getElementById('resultsMeta').innerHTML =
-      '<span class="meta-chip">State <strong>' + escapeHTML(selectedState) + '</strong></span>' +
-      '<span class="meta-chip">Search by <strong>' + escapeHTML(selectedMode === 'operator' ? 'Operator' : 'Course') + '</strong></span>' +
-      '<span class="meta-chip">Matches <strong>' + activeMatches.length + '</strong></span>';
-    showStep('results');
+    showResults('course');
   });
 
   searchBox.addEventListener('input', function () {
@@ -1772,6 +1817,47 @@ var appJS = `
 
   function memberName(m) {
     return m.firstName + ' ' + m.lastName;
+  }
+
+  function renderOperators(query) {
+    if (!members.length) {
+      operatorList.innerHTML = '<div class="empty-state">No directory data has been imported yet.</div>';
+      return;
+    }
+    const normalizedQuery = String(query || '').trim().toLowerCase();
+    const operators = unique(members.map((m) => memberName(m)));
+    const filtered = operators.filter((name) => {
+      const operatorMembers = members.filter((m) => memberName(m) === name);
+      return !normalizedQuery || operatorMembers.some((m) => searchable(m).includes(normalizedQuery) || name.toLowerCase().includes(normalizedQuery));
+    });
+    if (!filtered.length) {
+      operatorList.innerHTML = '<div class="empty-state">No operators match that search.</div>';
+      return;
+    }
+    operatorList.innerHTML = filtered.map((name) => {
+      const operatorMembers = members.filter((m) => memberName(m) === name);
+      const states = unique(operatorMembers.map((m) => m.state)).join(', ');
+      const courses = unique(operatorMembers.map((m) => m.homeCourse)).length;
+      const roles = unique(operatorMembers.map((m) => m.role)).join(', ');
+      return '<button class="choice-card course-card" type="button" data-operator="' + escapeHTML(name) + '">' +
+        '<span><strong>' + escapeHTML(name) + '</strong><span>' + escapeHTML(states + (roles ? ' / ' + roles : '')) + '</span></span>' +
+        '<span>' + courses + ' course note' + (courses === 1 ? '' : 's') + '</span></button>';
+    }).join('');
+  }
+
+  function showResults(backStep) {
+    searchBox.value = '';
+    renderMembers(activeMatches);
+    const matchLabel = activeMatches.length + ' match' + (activeMatches.length === 1 ? '' : 'es');
+    const stateLabel = selectedState || unique(activeMatches.map((m) => m.state)).join(', ');
+    resultsBackButton.dataset.next = backStep;
+    document.getElementById('resultsEyebrow').textContent = (stateLabel || 'Directory') + ' / ' + matchLabel;
+    document.getElementById('resultsTitle').textContent = selectedOption;
+    document.getElementById('resultsMeta').innerHTML =
+      (stateLabel ? '<span class="meta-chip">State <strong>' + escapeHTML(stateLabel) + '</strong></span>' : '') +
+      '<span class="meta-chip">Search by <strong>' + escapeHTML(selectedMode === 'operator' ? 'Operator' : 'Course') + '</strong></span>' +
+      '<span class="meta-chip">Matches <strong>' + activeMatches.length + '</strong></span>';
+    showStep('results');
   }
 
   function renderMembers(list) {
