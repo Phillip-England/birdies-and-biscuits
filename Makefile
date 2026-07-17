@@ -1,2 +1,5 @@
 run:
-	go run . serve -env .env -addr :8725
+	go run . serve
+
+init:
+	go run . init

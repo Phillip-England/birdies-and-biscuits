@@ -36,7 +36,9 @@ const (
 	loginWindow       = 24 * time.Hour
 	maxLoginFailures  = 5
 	maxCSVBytes       = 5 << 20
-	defaultListenAddr = ":8725"
+	defaultListenAddr = ":8777"
+	defaultEnvPath    = "config/.env"
+	defaultDBPath     = "data/main.sqlite"
 )
 
 type Config struct {
@@ -113,21 +115,30 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  birdies-and-biscuits init -env /path/to/.env")
-	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits serve -env /path/to/.env [-addr %s]\n", defaultListenAddr)
+	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits init [-env %s] [-db %s]\n", defaultEnvPath, defaultDBPath)
+	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits serve [-env %s] [-addr %s]\n", defaultEnvPath, defaultListenAddr)
 }
 
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	envPath := fs.String("env", "", "path to create env file")
+	envPath := fs.String("env", defaultEnvPath, "path to create env file")
+	dbPath := fs.String("db", defaultDBPath, "path to create SQLite database")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*envPath) == "" {
-		return errors.New("init requires -env")
+	if strings.TrimSpace(*envPath) == "" || strings.TrimSpace(*dbPath) == "" {
+		return errors.New("env and db paths cannot be empty")
 	}
-	if _, err := os.Stat(*envPath); err == nil {
-		return fmt.Errorf("%s already exists", *envPath)
+	absEnv, err := filepath.Abs(*envPath)
+	if err != nil {
+		return err
+	}
+	absDB, err := filepath.Abs(*dbPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(absEnv); err == nil {
+		return fmt.Errorf("%s already exists", absEnv)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -135,26 +146,41 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	content := fmt.Sprintf("ADMIN_USERNAME=admin\nADMIN_PASSWORD=change-me-now\nSESSION_SECRET=%s\nDB_PATH=app.sqlite\n", secret)
-	if err := os.MkdirAll(filepath.Dir(*envPath), 0755); err != nil {
+	dbConfigPath, err := filepath.Rel(filepath.Dir(absEnv), absDB)
+	if err != nil {
+		dbConfigPath = absDB
+	}
+	content := fmt.Sprintf("ADMIN_USERNAME=admin\nADMIN_PASSWORD=change-me-now\nSESSION_SECRET=%s\nDB_PATH=%s\n", secret, dbConfigPath)
+	if err := os.MkdirAll(filepath.Dir(absEnv), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(*envPath, []byte(content), 0600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(absDB), 0755); err != nil {
 		return err
 	}
-	fmt.Printf("created %s\n", *envPath)
+	if err := os.WriteFile(absEnv, []byte(content), 0600); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", absDB)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		return fmt.Errorf("initialize database: %w", err)
+	}
+	fmt.Printf("created %s\ninitialized %s\n", absEnv, absDB)
 	return nil
 }
 
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	envPath := fs.String("env", "", "path to env file")
+	envPath := fs.String("env", defaultEnvPath, "path to env file")
 	addr := fs.String("addr", defaultListenAddr, "address to listen on")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*envPath) == "" {
-		return errors.New("serve requires -env")
+		return errors.New("env path cannot be empty")
 	}
 	cfg, err := loadConfig(*envPath)
 	if err != nil {

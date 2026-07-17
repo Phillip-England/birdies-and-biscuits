@@ -7,20 +7,29 @@ A single-binary Go application for turning the maintained member CSV into a guid
 Initialize an environment file:
 
 ```sh
-go run . init -env .env
+go run . init
 ```
 
-Start the server with an explicit environment file path:
+This creates `./config/.env` and initializes `./data/main.sqlite`.
+
+Start the server:
 
 ```sh
-go run . serve -env .env
+go run . serve
 ```
 
-Then open **http://localhost:8725**.
+Then open **http://localhost:8777**.
 
-Port `8725` is the application's dedicated default port. If a deployment requires a
+Port `8777` is the application's dedicated default port. If a deployment requires a
 different listener, override it with `-addr`, for example
-`go run . serve -env .env -addr :9000`.
+`go run . serve -addr :9000`.
+
+To keep either file elsewhere, pass its location explicitly during initialization:
+
+```sh
+go run . init -env /path/to/.env -db /path/to/main.sqlite
+go run . serve -env /path/to/.env
+```
 
 ## Environment file
 
@@ -28,7 +37,7 @@ different listener, override it with `-addr`, for example
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-me-now
 SESSION_SECRET=<random-secret>
-DB_PATH=app.sqlite
+DB_PATH=../data/main.sqlite
 ```
 
 `DB_PATH` may be relative. Relative paths are resolved from the environment file's directory, so a server deployment can keep the file in `/etc` and the SQLite database beside it or at an absolute path.
