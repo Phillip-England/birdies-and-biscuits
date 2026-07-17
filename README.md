@@ -13,10 +13,14 @@ go run . init -env .env
 Start the server with an explicit environment file path:
 
 ```sh
-go run . serve -env .env -addr :8080
+go run . serve -env .env
 ```
 
-Then open `http://localhost:8080`.
+Then open **http://localhost:8725**.
+
+Port `8725` is the application's dedicated default port. If a deployment requires a
+different listener, override it with `-addr`, for example
+`go run . serve -env .env -addr :9000`.
 
 ## Environment file
 

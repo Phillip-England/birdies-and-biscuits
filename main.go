@@ -36,6 +36,7 @@ const (
 	loginWindow       = 24 * time.Hour
 	maxLoginFailures  = 5
 	maxCSVBytes       = 5 << 20
+	defaultListenAddr = ":8725"
 )
 
 type Config struct {
@@ -113,7 +114,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintln(os.Stderr, "  birdies-and-biscuits init -env /path/to/.env")
-	fmt.Fprintln(os.Stderr, "  birdies-and-biscuits serve -env /path/to/.env [-addr :8080]")
+	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits serve -env /path/to/.env [-addr %s]\n", defaultListenAddr)
 }
 
 func runInit(args []string) error {
@@ -148,7 +149,7 @@ func runInit(args []string) error {
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	envPath := fs.String("env", "", "path to env file")
-	addr := fs.String("addr", ":8080", "address to listen on")
+	addr := fs.String("addr", defaultListenAddr, "address to listen on")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
