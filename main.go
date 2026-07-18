@@ -32,9 +32,12 @@ import (
 
 const (
 	sessionCookieName = "bab_session"
+	accessCookieName  = "bab_access"
 	sessionLifetime   = 12 * time.Hour
 	loginWindow       = 24 * time.Hour
+	accessBanWindow   = 24 * time.Hour
 	maxLoginFailures  = 5
+	maxAccessFailures = 3
 	maxCSVBytes       = 5 << 20
 	defaultListenAddr = ":8777"
 	defaultEnvPath    = "config/.env"
@@ -82,13 +85,23 @@ type ImportSummary struct {
 }
 
 type PageData struct {
-	Title     string
-	Error     string
-	Message   string
-	IsAuthed  bool
-	Members   template.JS
-	Summary   ImportSummary
-	StartedAt string
+	Title         string
+	Error         string
+	Message       string
+	IsAuthed      bool
+	Members       template.JS
+	Summary       ImportSummary
+	StartedAt     string
+	AccessHost    string
+	AccessHash    string
+	AccessPath    string
+	AccessURL     string
+	AccessBlocked bool
+}
+
+type AccessSettings struct {
+	Host string
+	Hash string
 }
 
 func main() {
@@ -107,6 +120,10 @@ func main() {
 		if err := runServe(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
+	case "reset-bans":
+		if err := runResetBans(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -117,6 +134,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
 	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits init [-env %s] [-db %s]\n", defaultEnvPath, defaultDBPath)
 	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits serve [-env %s] [-addr %s]\n", defaultEnvPath, defaultListenAddr)
+	fmt.Fprintf(os.Stderr, "  birdies-and-biscuits reset-bans [-env %s]\n", defaultEnvPath)
 }
 
 func runInit(args []string) error {
@@ -209,6 +227,41 @@ func runServe(args []string) error {
 	return server.ListenAndServe()
 }
 
+func runResetBans(args []string) error {
+	fs := flag.NewFlagSet("reset-bans", flag.ContinueOnError)
+	envPath := fs.String("env", defaultEnvPath, "path to env file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*envPath)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"login_failures", "access_failures", "access_bans"} {
+		if _, err := tx.Exec(`DELETE FROM ` + table); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	fmt.Println("cleared all login and private-access bans")
+	return nil
+}
+
 func loadConfig(envPath string) (Config, error) {
 	absEnv, err := filepath.Abs(envPath)
 	if err != nil {
@@ -255,6 +308,19 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_login_failures_ip_time
 			ON login_failures (ip, attempted_at);`,
+		`CREATE TABLE IF NOT EXISTS access_failures (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ip TEXT NOT NULL,
+			attempted_at INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_access_failures_ip_time
+			ON access_failures (ip, attempted_at);`,
+		`CREATE TABLE IF NOT EXISTS access_bans (
+			ip TEXT PRIMARY KEY,
+			blocked_until INTEGER NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_access_bans_until
+			ON access_bans (blocked_until);`,
 		`CREATE TABLE IF NOT EXISTS members (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			first_name TEXT NOT NULL,
@@ -272,6 +338,12 @@ func migrate(db *sql.DB) error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_members_state_city ON members (state, city);`,
 		`CREATE INDEX IF NOT EXISTS idx_members_course ON members (home_course);`,
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);`,
+		`INSERT OR IGNORE INTO app_settings (key, value) VALUES ('access_host', 'directory');`,
+		`INSERT OR IGNORE INTO app_settings (key, value) VALUES ('access_hash', 'welcome');`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -283,7 +355,8 @@ func migrate(db *sql.DB) error {
 
 func (a *App) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", a.handleHome)
+	mux.HandleFunc("GET /", a.handlePublicRoute)
+	mux.HandleFunc("POST /", a.handlePublicPost)
 	mux.HandleFunc("GET /assets/app.css", a.handleCSS)
 	mux.HandleFunc("GET /assets/app.js", a.handleJS)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
@@ -292,6 +365,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /logout", a.handleLogout)
 	mux.HandleFunc("GET /admin", a.requireAuth(a.handleAdmin))
 	mux.HandleFunc("POST /admin/upload", a.requireAuth(a.handleUpload))
+	mux.HandleFunc("POST /admin/access", a.requireAuth(a.handleAccessSettings))
 	return secureHeaders(mux)
 }
 
@@ -302,6 +376,108 @@ func secureHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func accessParts(path string) (string, string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func (a *App) handlePublicRoute(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := accessParts(r.URL.Path); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	a.handleAccessGet(w, r)
+}
+
+func (a *App) handlePublicPost(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := accessParts(r.URL.Path); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	a.handleAccessPost(w, r)
+}
+
+func (a *App) requestedAccessSettings(r *http.Request) (AccessSettings, bool) {
+	host, hash, ok := accessParts(r.URL.Path)
+	if !ok {
+		return AccessSettings{}, false
+	}
+	settings, err := a.accessSettings(r.Context())
+	if err != nil {
+		return AccessSettings{}, false
+	}
+	return settings, subtleEqual(host, settings.Host) && subtleEqual(hash, settings.Hash)
+}
+
+func (a *App) handleAccessGet(w http.ResponseWriter, r *http.Request) {
+	settings, ok := a.requestedAccessSettings(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if a.hasAccess(r, settings) {
+		a.handleHome(w, r)
+		return
+	}
+	blocked, err := a.isAccessBlocked(r.Context(), clientIP(r), time.Now())
+	if err != nil {
+		http.Error(w, "private access unavailable", http.StatusInternalServerError)
+		return
+	}
+	if blocked {
+		w.WriteHeader(http.StatusTooManyRequests)
+		a.render(w, "challenge", PageData{Title: "Private Access", Error: "Too many incorrect answers. Access is blocked for 24 hours.", AccessBlocked: true})
+		return
+	}
+	a.render(w, "challenge", PageData{Title: "Private Access"})
+}
+
+func (a *App) handleAccessPost(w http.ResponseWriter, r *http.Request) {
+	settings, ok := a.requestedAccessSettings(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	now := time.Now()
+	ip := clientIP(r)
+	blocked, err := a.isAccessBlocked(r.Context(), ip, now)
+	if err != nil {
+		http.Error(w, "private access unavailable", http.StatusInternalServerError)
+		return
+	}
+	if blocked {
+		w.WriteHeader(http.StatusTooManyRequests)
+		a.render(w, "challenge", PageData{Title: "Private Access", Error: "Too many incorrect answers. Access is blocked for 24 hours.", AccessBlocked: true})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if !subtleEqual(strings.TrimSpace(r.FormValue("answer")), "1964") {
+		blocked, err = a.recordAccessFailure(r.Context(), ip, now)
+		if err != nil {
+			http.Error(w, "private access unavailable", http.StatusInternalServerError)
+			return
+		}
+		if blocked {
+			w.WriteHeader(http.StatusTooManyRequests)
+			a.render(w, "challenge", PageData{Title: "Private Access", Error: "Too many incorrect answers. Access is blocked for 24 hours.", AccessBlocked: true})
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		a.render(w, "challenge", PageData{Title: "Private Access", Error: "That answer is not correct."})
+		return
+	}
+	a.setAccessCookie(w, r, settings)
+	http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
 }
 
 func (a *App) handleHome(w http.ResponseWriter, r *http.Request) {
@@ -316,10 +492,11 @@ func (a *App) handleHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.render(w, "home", PageData{
-		Title:     "Birdies & Biscuits",
-		Members:   template.JS(membersJSON),
-		Summary:   summarizeMembers(members),
-		StartedAt: time.Now().Format(time.RFC3339),
+		Title:      "Birdies & Biscuits",
+		Members:    template.JS(membersJSON),
+		Summary:    summarizeMembers(members),
+		StartedAt:  time.Now().Format(time.RFC3339),
+		AccessPath: r.URL.Path,
 	})
 }
 
@@ -407,12 +584,117 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	message := r.URL.Query().Get("message")
 	errMsg := r.URL.Query().Get("error")
+	settings, err := a.accessSettings(r.Context())
+	if err != nil {
+		http.Error(w, "could not load access settings", http.StatusInternalServerError)
+		return
+	}
+	accessPath := "/" + settings.Host + "/" + settings.Hash
 	a.render(w, "admin", PageData{
-		Title:    "Admin",
-		IsAuthed: true,
-		Summary:  summarizeMembers(members),
-		Message:  message,
-		Error:    errMsg,
+		Title:      "Admin",
+		IsAuthed:   true,
+		Summary:    summarizeMembers(members),
+		Message:    message,
+		Error:      errMsg,
+		AccessHost: settings.Host,
+		AccessHash: settings.Hash,
+		AccessPath: accessPath,
+		AccessURL:  requestOrigin(r) + accessPath,
+	})
+}
+
+func requestOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwarded == "http" || forwarded == "https" {
+		scheme = forwarded
+	}
+	return scheme + "://" + r.Host
+}
+
+var accessPartPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$`)
+
+func (a *App) handleAccessSettings(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		redirectAdmin(w, r, "", "Invalid access settings form.")
+		return
+	}
+	host := strings.TrimSpace(r.FormValue("access_host"))
+	hash := strings.TrimSpace(r.FormValue("access_hash"))
+	if !accessPartPattern.MatchString(host) || !accessPartPattern.MatchString(hash) {
+		redirectAdmin(w, r, "", "Host and hash must be 3-64 characters using letters, numbers, hyphens, or underscores.")
+		return
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		redirectAdmin(w, r, "", "Could not update the private link.")
+		return
+	}
+	defer tx.Rollback()
+	for key, value := range map[string]string{"access_host": host, "access_hash": hash} {
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+			redirectAdmin(w, r, "", "Could not update the private link.")
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		redirectAdmin(w, r, "", "Could not update the private link.")
+		return
+	}
+	redirectAdmin(w, r, "Private directory link updated. Previous links are no longer valid.", "")
+}
+
+func (a *App) accessSettings(ctx context.Context) (AccessSettings, error) {
+	settings := AccessSettings{}
+	rows, err := a.db.QueryContext(ctx, `SELECT key, value FROM app_settings WHERE key IN ('access_host', 'access_hash')`)
+	if err != nil {
+		return settings, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return settings, err
+		}
+		if key == "access_host" {
+			settings.Host = value
+		} else if key == "access_hash" {
+			settings.Hash = value
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return settings, err
+	}
+	if settings.Host == "" || settings.Hash == "" {
+		return settings, errors.New("access settings are incomplete")
+	}
+	return settings, nil
+}
+
+func (a *App) accessSignature(settings AccessSettings) string {
+	mac := hmac.New(sha256.New, []byte(a.cfg.SessionSecret))
+	mac.Write([]byte(settings.Host + "\x00" + settings.Hash + "\x00private-directory"))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (a *App) hasAccess(r *http.Request, settings AccessSettings) bool {
+	cookie, err := r.Cookie(accessCookieName)
+	return err == nil && hmac.Equal([]byte(cookie.Value), []byte(a.accessSignature(settings)))
+}
+
+func (a *App) setAccessCookie(w http.ResponseWriter, r *http.Request, settings AccessSettings) {
+	now := time.Now()
+	http.SetCookie(w, &http.Cookie{
+		Name:     accessCookieName,
+		Value:    a.accessSignature(settings),
+		Path:     r.URL.Path,
+		Expires:  now.Add(sessionLifetime),
+		MaxAge:   int(sessionLifetime.Seconds()),
+		HttpOnly: true,
+		Secure:   strings.HasPrefix(requestOrigin(r), "https://"),
+		SameSite: http.SameSiteStrictMode,
 	})
 }
 
@@ -595,6 +877,65 @@ func (a *App) countFailures(ctx context.Context, ip string, now time.Time) (int,
 	var count int
 	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM login_failures WHERE ip = ? AND attempted_at >= ?`, ip, now.Add(-loginWindow).Unix()).Scan(&count)
 	return count, err
+}
+
+func (a *App) isAccessBlocked(ctx context.Context, ip string, now time.Time) (bool, error) {
+	if err := a.purgeAccessFailures(ctx, now); err != nil {
+		return false, err
+	}
+	var blockedUntil int64
+	err := a.db.QueryRowContext(ctx, `SELECT blocked_until FROM access_bans WHERE ip = ?`, ip).Scan(&blockedUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return blockedUntil > now.Unix(), err
+}
+
+func (a *App) recordAccessFailure(ctx context.Context, ip string, now time.Time) (bool, error) {
+	if err := a.purgeAccessFailures(ctx, now); err != nil {
+		return false, err
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO access_failures (ip, attempted_at) VALUES (?, ?)`, ip, now.Unix()); err != nil {
+		return false, err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM access_failures WHERE ip = ? AND attempted_at >= ?`, ip, now.Add(-accessBanWindow).Unix()).Scan(&count); err != nil {
+		return false, err
+	}
+	blocked := count >= maxAccessFailures
+	if blocked {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO access_bans (ip, blocked_until) VALUES (?, ?)
+			ON CONFLICT(ip) DO UPDATE SET blocked_until = excluded.blocked_until`, ip, now.Add(accessBanWindow).Unix()); err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM access_failures WHERE ip = ?`, ip); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return blocked, nil
+}
+
+func (a *App) purgeAccessFailures(ctx context.Context, now time.Time) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM access_failures WHERE attempted_at < ?`, now.Add(-accessBanWindow).Unix()); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM access_bans WHERE blocked_until <= ?`, now.Unix()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func clientIP(r *http.Request) string {
@@ -868,14 +1209,32 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
 </head>
 <body>
 {{end}}
-{{define "layoutBottom"}}</body></html>{{end}}
+{{define "layoutBottom"}}<footer class="site-footer">Built with ❤️ by <a href="https://philli-england.com" target="_blank" rel="noopener noreferrer">Phillip England</a></footer></body></html>{{end}}
+
+{{define "challenge"}}
+{{template "layoutTop" .}}
+<main class="auth-page">
+  <section class="auth-card">
+    <div class="loader-line" aria-hidden="true"></div>
+    <img class="auth-logo" src="/static/logo.png" alt="Birdies & Biscuits">
+    <p class="eyebrow">Private Directory</p>
+    <h1>One question before you start exploring.</h1>
+    {{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}
+    {{if not .AccessBlocked}}<form method="post" class="stack-form">
+      <label>What year was the sandwich invented?<input name="answer" type="text" inputmode="numeric" autocomplete="off" required autofocus></label>
+      <button class="primary-action full" type="submit">Continue</button>
+    </form>{{end}}
+  </section>
+</main>
+{{template "layoutBottom" .}}
+{{end}}
 
 {{define "home"}}
 {{template "layoutTop" .}}
 <main class="public-shell" data-members='{{.Members}}'>
   <canvas class="ambient-gl" id="ambientGl" aria-hidden="true"></canvas>
   <header class="app-topbar">
-    <a class="topbar-brand" href="/" aria-label="Birdies & Biscuits home">
+    <a class="topbar-brand" href="{{.AccessPath}}" aria-label="Birdies & Biscuits home">
       <img src="/static/logo.png" alt="">
       <span>Birdies & Biscuits Directory</span>
     </a>
@@ -1013,7 +1372,6 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <button class="primary-action full" type="submit">Sign in</button>
     </form>
-    <a class="quiet-link" href="/">Return to public directory</a>
   </section>
 </main>
 {{template "layoutBottom" .}}
@@ -1023,7 +1381,7 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
 {{template "layoutTop" .}}
 <main class="admin-shell">
   <nav class="admin-nav">
-    <a href="/" class="mark-link"><span class="mark"><img src="/static/logo.png" alt=""></span><span>Public directory</span></a>
+    <a href="{{.AccessPath}}" class="mark-link"><span class="mark"><img src="/static/logo.png" alt=""></span><span>Private directory</span></a>
     <form method="post" action="/logout"><button class="ghost-action" type="submit">Logout</button></form>
   </nav>
   <section class="admin-hero">
@@ -1036,6 +1394,24 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
   </section>
   {{if .Message}}<div class="alert success">{{.Message}}</div>{{end}}
   {{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}
+  <section class="access-settings">
+    <div>
+      <p class="eyebrow">Member Access Link</p>
+      <h2>Choose the private link you send to members.</h2>
+      <p class="muted">Members who open this link must answer the sandwich question with <strong>1964</strong> before they can view the protected member data.</p>
+      <div class="access-link-row">
+        <a class="quiet-link access-preview" id="memberAccessLink" href="{{.AccessPath}}">{{.AccessURL}}</a>
+        <button class="secondary-action copy-link-button" type="button" id="copyAccessLink" data-url="{{.AccessURL}}">Copy link</button>
+      </div>
+      <p class="copy-status" id="copyAccessStatus" role="status" aria-live="polite"></p>
+    </div>
+    <form method="post" action="/admin/access" class="stack-form access-form">
+      <label>First part of link<input name="access_host" value="{{.AccessHost}}" minlength="3" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,63}" required></label>
+      <label>Second part of link<input name="access_hash" value="{{.AccessHash}}" minlength="3" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,63}" required></label>
+      <p class="field-help">These create /{{.AccessHost}}/{{.AccessHash}} on this website. Changing either part disables the old link and asks everyone to enter 1964 again.</p>
+      <button class="primary-action" type="submit">Update member access link</button>
+    </form>
+  </section>
   <section class="upload-zone">
     <form method="post" action="/admin/upload" enctype="multipart/form-data" class="upload-form">
       <label class="file-picker">
@@ -1056,6 +1432,36 @@ var pageTemplates = `{{define "layoutTop"}}<!doctype html>
 <script>
 document.querySelector('input[type=file]')?.addEventListener('change', function () {
   document.getElementById('fileName').textContent = this.files[0]?.name || 'No file selected';
+});
+
+document.getElementById('copyAccessLink')?.addEventListener('click', async function () {
+  const button = this;
+  const url = button.dataset.url;
+  const status = document.getElementById('copyAccessStatus');
+
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(url);
+    } else {
+      const input = document.createElement('textarea');
+      input.value = url;
+      input.setAttribute('readonly', '');
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      if (!document.execCommand('copy')) throw new Error('copy failed');
+      input.remove();
+    }
+    button.textContent = 'Copied!';
+    status.textContent = 'Private member link copied to clipboard.';
+    window.setTimeout(() => {
+      button.textContent = 'Copy link';
+      status.textContent = '';
+    }, 2500);
+  } catch (error) {
+    status.textContent = 'Could not copy automatically. Select the link and copy it manually.';
+  }
 });
 </script>
 {{template "layoutBottom" .}}
@@ -1138,7 +1544,7 @@ button { cursor: pointer; }
 .step.is-active {
   display: block;
 }
-.intro-panel, .finder-panel, .results-panel, .auth-card, .upload-zone {
+.intro-panel, .finder-panel, .results-panel, .auth-card, .upload-zone, .access-settings {
   background: var(--paper);
   border: 1px solid #dde2e8;
   box-shadow: var(--shadow);
@@ -1603,6 +2009,29 @@ label input:not([type="file"]) {
   display: block;
   font-size: 2.4rem;
 }
+.access-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, .7fr);
+  gap: 28px;
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 22px;
+}
+.access-settings h2 { font-size: 1.65rem; }
+.access-link-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+}
+.access-preview { min-width: 0; overflow-wrap: anywhere; }
+.copy-link-button { flex: 0 0 auto; white-space: nowrap; }
+.copy-status { min-height: 1.3em; margin: 7px 0 0; color: #166534; font-size: .9rem; font-weight: 700; }
+.access-form { margin-top: 0; }
+.field-help { color: var(--muted); font-size: .9rem; margin: -2px 0 2px; }
 .upload-zone {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(260px, .8fr);
@@ -1648,6 +2077,18 @@ label input:not([type="file"]) {
 .schema-box h2 {
   font-size: 1.35rem;
 }
+.site-footer {
+  padding: 22px 16px;
+  color: var(--muted);
+  text-align: center;
+  font-size: .9rem;
+}
+.site-footer a {
+  color: var(--red);
+  font-weight: 800;
+  text-decoration: none;
+}
+.site-footer a:hover { text-decoration: underline; }
 @media (max-width: 760px) {
   .ambient-gl {
     inset: 76px 0 0 0;
@@ -1672,7 +2113,7 @@ label input:not([type="file"]) {
   }
   .module-kicker { padding-top: 0; max-width: 190px; }
   .auth-page, .admin-shell { width: min(100% - 20px, 1120px); }
-  .quick-stats, .admin-hero, .upload-zone, .path-grid { grid-template-columns: 1fr; }
+  .quick-stats, .admin-hero, .upload-zone, .access-settings, .path-grid { grid-template-columns: 1fr; }
   .quick-stats div { border-right: 0; border-bottom: 1px solid var(--line); }
   .quick-stats div:last-child { border-bottom: 0; }
   .course-card, .results-top { grid-template-columns: 1fr; align-items: start; }
@@ -1681,6 +2122,7 @@ label input:not([type="file"]) {
   .results-heading .ghost-action { width: max-content; }
   .member-card-top { display: grid; }
   .brand-row, .admin-nav { align-items: flex-start; }
+  .access-link-row { align-items: stretch; flex-direction: column; }
   .schema-box { border-left: 0; border-top: 1px solid var(--line); padding-left: 0; padding-top: 18px; }
   h1 { font-size: 2.5rem; }
 }

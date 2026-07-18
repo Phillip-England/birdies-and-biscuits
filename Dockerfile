@@ -3,4 +3,4 @@ WORKDIR /app
 COPY . .
 RUN go build -o /usr/local/bin/birdies-and-biscuits .
 EXPOSE 8777
-CMD ["birdies-and-biscuits"]
+CMD ["birdies-and-biscuits", "serve"]

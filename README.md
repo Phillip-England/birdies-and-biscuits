@@ -18,7 +18,9 @@ Start the server:
 go run . serve
 ```
 
-Then open **http://localhost:8777**.
+The site root intentionally returns a 404. After initialization, the private directory
+starts at **http://localhost:8777/directory/welcome**. Visitors must answer the private
+access question before directory data is rendered.
 
 Port `8777` is the application's dedicated default port. If a deployment requires a
 different listener, override it with `-addr`, for example
@@ -44,7 +46,22 @@ DB_PATH=../data/main.sqlite
 
 ## CSV upload
 
-The admin portal is available at `/login`. Uploading a CSV replaces the public directory.
+The admin portal is available at `/login`. Its **Member Access Link** is the private URL
+shared with members. The two editable values form the URL path; the site's domain is
+determined by the deployment. Changing either value immediately invalidates the old URL.
+Visitors must answer `1964` before any member data is rendered. A successful answer is
+remembered in a signed, link-specific cookie for 12 hours; changing the private link
+invalidates existing access cookies. Uploading a CSV replaces the protected member directory.
+
+Three incorrect private-access answers from the same IP address block access for 24
+hours. Expired attempts are deleted automatically so the SQLite table remains bounded.
+To immediately clear every private-access and admin-login ban, run:
+
+```sh
+go run . reset-bans
+```
+
+Pass `-env /path/to/.env` when using a non-default environment file.
 
 Required columns:
 
